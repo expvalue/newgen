@@ -1,272 +1,324 @@
+# High-level idea: detect a towel in a selected table region and compute real fold-relevant corners.
+# Why it works: for towel folding, geometry inside a controlled ROI is more reliable than generic YOLO scene segmentation.
+# Approach: segment the largest towel-like contour in ROI, approximate 4 corners, compute fold targets, and draw fold arcs.
+# Time complexity: O(n) per frame over ROI pixels and contour points.
+# Space complexity: O(n) for the ROI image, mask, contour, and overlay.
+
+from __future__ import annotations
+
 import argparse
 import time
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
 
-try:
-    from ultralytics import YOLO
-except Exception:
-    YOLO = None
+Point = Tuple[int, int]
 
 
-def order_points(pts):
-    pts = pts.astype("float32")
+def order_points(pts: np.ndarray) -> np.ndarray:
+    pts = pts.astype(np.float32)
+    rect = np.zeros((4, 2), dtype=np.float32)
+
     s = pts.sum(axis=1)
     d = np.diff(pts, axis=1).reshape(-1)
 
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmin(d)]
-    bl = pts[np.argmax(d)]
+    rect[0] = pts[np.argmin(s)]   # TL
+    rect[2] = pts[np.argmax(s)]   # BR
+    rect[1] = pts[np.argmin(d)]   # TR
+    rect[3] = pts[np.argmax(d)]   # BL
 
-    return {
-        "TL": tuple(tl.astype(int)),
-        "TR": tuple(tr.astype(int)),
-        "BR": tuple(br.astype(int)),
-        "BL": tuple(bl.astype(int)),
-    }
+    return rect
 
 
-def clean_mask(mask):
-    mask = mask.astype("uint8")
-    _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-
-    kernel = np.ones((7, 7), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    return mask
+def as_point(p: np.ndarray) -> Point:
+    return int(round(float(p[0]))), int(round(float(p[1])))
 
 
-def yolo_mask(frame, model, min_conf):
-    if model is None:
-        return None, 0.0
-
-    results = model.predict(frame, conf=min_conf, retina_masks=True, verbose=False)
-
-    if not results or results[0].masks is None:
-        return None, 0.0
-
-    masks = results[0].masks.data.cpu().numpy()
-    confs = results[0].boxes.conf.cpu().numpy()
-
-    if len(masks) == 0:
-        return None, 0.0
-
-    best_idx = max(range(len(masks)), key=lambda i: masks[i].sum() * confs[i])
-
-    h, w = frame.shape[:2]
-    mask = (masks[best_idx] > 0.5).astype("uint8") * 255
-    mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-
-    return clean_mask(mask), float(confs[best_idx])
+def midpoint(a: Point, b: Point) -> Point:
+    return ((a[0] + b[0]) // 2, (a[1] + b[1]) // 2)
 
 
-def fallback_mask(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (7, 7), 0)
-
-    _, mask1 = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    mask2 = cv2.bitwise_not(mask1)
-
-    candidates = [clean_mask(mask1), clean_mask(mask2)]
-
-    h, w = frame.shape[:2]
-    frame_area = h * w
-    best = None
-    best_area = 0
-
-    for mask in candidates:
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        for c in contours:
-            area = cv2.contourArea(c)
-
-            if area < frame_area * 0.015:
-                continue
-
-            if area > frame_area * 0.85:
-                continue
-
-            if area > best_area:
-                best_area = area
-                best = np.zeros((h, w), dtype=np.uint8)
-                cv2.drawContours(best, [c], -1, 255, cv2.FILLED)
-
-    return clean_mask(best) if best is not None else None
-
-
-def get_points(mask):
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return None
-
-    contour = max(contours, key=cv2.contourArea)
-
-    if cv2.contourArea(contour) < 1000:
-        return None
-
-    rect = cv2.minAreaRect(contour)
-    box = cv2.boxPoints(rect)
-    corners = order_points(box)
-
-    pts = contour.reshape(-1, 2)
-
-    tl = np.array(corners["TL"])
-    tr = np.array(corners["TR"])
-    br = np.array(corners["BR"])
-    bl = np.array(corners["BL"])
-
-    m = cv2.moments(contour)
-    if m["m00"] != 0:
-        center = (int(m["m10"] / m["m00"]), int(m["m01"] / m["m00"]))
-    else:
-        center = tuple(pts.mean(axis=0).astype(int))
-
-    left_edge_mid = tuple(((tl + bl) / 2).astype(int))
-    right_edge_mid = tuple(((tr + br) / 2).astype(int))
-    fold_line_top = tuple(((tl + tr) / 2).astype(int))
-    fold_line_bottom = tuple(((bl + br) / 2).astype(int))
-
-    points = {
-        **corners,
-        "CENTER": center,
-        "LEFTMOST": tuple(pts[np.argmin(pts[:, 0])]),
-        "RIGHTMOST": tuple(pts[np.argmax(pts[:, 0])]),
-        "TOPMOST": tuple(pts[np.argmin(pts[:, 1])]),
-        "BOTTOMMOST": tuple(pts[np.argmax(pts[:, 1])]),
-        "LEFT_EDGE_MID": left_edge_mid,
-        "RIGHT_EDGE_MID": right_edge_mid,
-        "FOLD_LINE_TOP": fold_line_top,
-        "FOLD_LINE_BOTTOM": fold_line_bottom,
-        "GRASP": left_edge_mid,
-        "PLACE": right_edge_mid,
-    }
-
-    x, y, w, h = cv2.boundingRect(contour)
-    bbox = (x, y, x + w, y + h)
-
-    return contour, bbox, points
-
-
-def label(img, text, point, color=(255, 255, 255), scale=0.5):
-    x, y = point
-    x = int(max(5, min(x, img.shape[1] - 180)))
-    y = int(max(20, min(y, img.shape[0] - 10)))
+def draw_label(img, text: str, pt: Point, color=(255, 255, 255), scale=0.55):
+    x, y = pt
+    x = max(5, min(x, img.shape[1] - 150))
+    y = max(20, min(y, img.shape[0] - 10))
 
     cv2.putText(img, text, (x + 1, y + 1), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
 
 
-def draw(frame, mask, confidence, source):
+def bezier_curve(p0: Point, p1: Point, p2: Point, samples: int = 40):
+    points = []
+    for t in np.linspace(0, 1, samples):
+        x = (1 - t) ** 2 * p0[0] + 2 * (1 - t) * t * p1[0] + t ** 2 * p2[0]
+        y = (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * p1[1] + t ** 2 * p2[1]
+        points.append((int(x), int(y)))
+    return points
+
+
+def draw_arc(img, start: Point, end: Point, height: int = 80, color=(255, 0, 255), thickness=2):
+    mx, my = midpoint(start, end)
+    control = (mx, my - height)
+    curve = bezier_curve(start, control, end, samples=50)
+
+    for i in range(len(curve) - 1):
+        cv2.line(img, curve[i], curve[i + 1], color, thickness)
+
+    if len(curve) >= 2:
+        cv2.arrowedLine(img, curve[-2], curve[-1], color, thickness, tipLength=0.5)
+
+
+def clean_mask(mask: np.ndarray) -> np.ndarray:
+    mask = mask.astype(np.uint8)
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    return mask
+
+
+def segment_towel(roi_bgr: np.ndarray) -> Optional[np.ndarray]:
+    # Try a few simple masks and keep the best towel-like contour.
+    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+
+    _, mask1 = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask2 = cv2.bitwise_not(mask1)
+
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+    _, mask3 = cv2.threshold(sat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask4 = cv2.bitwise_not(mask3)
+
+    candidates = [mask1, mask2, mask3, mask4]
+
+    h, w = roi_bgr.shape[:2]
+    roi_area = h * w
+
+    best_mask = None
+    best_score = -1
+
+    for raw in candidates:
+        mask = clean_mask(raw)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < roi_area * 0.05:
+                continue
+            if area > roi_area * 0.95:
+                continue
+
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            hull = cv2.convexHull(c)
+
+            hull_area = cv2.contourArea(hull)
+            solidity = area / hull_area if hull_area > 1e-6 else 0
+            rect = cv2.minAreaRect(c)
+            (rw, rh) = rect[1]
+            rect_area = max(rw * rh, 1e-6)
+            rectangularity = area / rect_area
+
+            # Prefer something cloth-like and compact.
+            score = area
+            if len(approx) == 4:
+                score *= 1.4
+            score *= (0.5 + solidity)
+            score *= (0.5 + rectangularity)
+
+            if score > best_score:
+                best_score = score
+                best_mask = np.zeros((h, w), dtype=np.uint8)
+                cv2.drawContours(best_mask, [c], -1, 255, thickness=cv2.FILLED)
+
+    if best_mask is None:
+        return None
+
+    return clean_mask(best_mask)
+
+
+def get_towel_corners(mask: np.ndarray) -> Optional[np.ndarray]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    contour = max(contours, key=cv2.contourArea)
+    peri = cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+
+    if len(approx) == 4:
+        pts = approx.reshape(4, 2)
+        return order_points(pts)
+
+    # Fallback: use minAreaRect corners if approx is not 4
+    rect = cv2.minAreaRect(contour)
+    box = cv2.boxPoints(rect)
+    return order_points(box)
+
+
+def overlay_mask(base: np.ndarray, mask: np.ndarray, color=(40, 180, 40), alpha=0.28):
+    layer = np.zeros_like(base)
+    layer[mask > 0] = color
+    return cv2.addWeighted(base, 1 - alpha, layer, alpha, 0)
+
+
+def draw_result(frame: np.ndarray, roi_rect, mask: np.ndarray, corners: np.ndarray, fold_mode: str) -> np.ndarray:
+    x, y, w, h = roi_rect
     out = frame.copy()
 
-    if mask is None:
-        label(out, "NO TOWEL / T-SHIRT DETECTED", (25, 40), (0, 0, 255), 0.8)
-        label(out, "Use a contrasting towel/shirt on a plain table", (25, 75), (0, 0, 255), 0.55)
-        return out
+    roi_view = out[y:y + h, x:x + w]
+    roi_view[:] = overlay_mask(roi_view, mask)
 
-    data = get_points(mask)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour = max(contours, key=cv2.contourArea)
+    cv2.drawContours(roi_view, [contour], -1, (0, 255, 255), 3)
 
-    if data is None:
-        label(out, "MASK FOUND, BUT NO STABLE CONTOUR", (25, 40), (0, 0, 255), 0.8)
-        return out
+    tl, tr, br, bl = [as_point(p) for p in corners]
 
-    contour, bbox, points = data
+    # Convert ROI-local points to frame-global points
+    def g(pt: Point) -> Point:
+        return (pt[0] + x, pt[1] + y)
 
-    overlay = np.zeros_like(out)
-    overlay[mask > 0] = (40, 180, 40)
-    out = cv2.addWeighted(out, 0.70, overlay, 0.30, 0)
+    TL, TR, BR, BL = map(g, [tl, tr, br, bl])
 
-    cv2.drawContours(out, [contour], -1, (0, 255, 255), 3)
-
-    x1, y1, x2, y2 = bbox
-    cv2.rectangle(out, (x1, y1), (x2, y2), (255, 255, 0), 2)
-
-    cv2.line(out, points["FOLD_LINE_TOP"], points["FOLD_LINE_BOTTOM"], (255, 0, 255), 3)
-    label(out, "FOLD_LINE", midpoint(points["FOLD_LINE_TOP"], points["FOLD_LINE_BOTTOM"]), (255, 0, 255))
-
-    cv2.arrowedLine(out, points["GRASP"], points["PLACE"], (255, 0, 255), 3, tipLength=0.08)
-    label(out, "FOLD DIRECTION", midpoint(points["GRASP"], points["PLACE"]), (255, 0, 255), 0.55)
+    # Draw corner points only, no giant bbox
+    points = {"TL": TL, "TR": TR, "BR": BR, "BL": BL}
+    offsets = {"TL": (-38, -12), "TR": (10, -12), "BR": (10, 20), "BL": (-38, 20)}
 
     for name, pt in points.items():
-        if name.startswith("FOLD_LINE"):
-            continue
+        cv2.circle(out, pt, 8, (0, 0, 255), -1)
+        dx, dy = offsets[name]
+        draw_label(out, name, (pt[0] + dx, pt[1] + dy), (0, 0, 255))
 
-        color = (255, 255, 255)
-        radius = 6
+    # Compute fold targets and pinch points
+    if fold_mode == "left_to_center":
+        pinch_a, pinch_b = TL, BL
+        target_a = midpoint(TL, TR)
+        target_b = midpoint(BL, BR)
+        fold_line_a = midpoint(TL, TR)
+        fold_line_b = midpoint(BL, BR)
+    elif fold_mode == "right_to_center":
+        pinch_a, pinch_b = TR, BR
+        target_a = midpoint(TL, TR)
+        target_b = midpoint(BL, BR)
+        fold_line_a = midpoint(TL, TR)
+        fold_line_b = midpoint(BL, BR)
+    elif fold_mode == "top_to_center":
+        pinch_a, pinch_b = TL, TR
+        target_a = midpoint(TL, BL)
+        target_b = midpoint(TR, BR)
+        fold_line_a = midpoint(TL, BL)
+        fold_line_b = midpoint(TR, BR)
+    else:  # bottom_to_center
+        pinch_a, pinch_b = BL, BR
+        target_a = midpoint(TL, BL)
+        target_b = midpoint(TR, BR)
+        fold_line_a = midpoint(TL, BL)
+        fold_line_b = midpoint(TR, BR)
 
-        if name in {"TL", "TR", "BR", "BL"}:
-            color = (0, 0, 255)
-            radius = 8
-        elif name in {"GRASP", "PLACE"}:
-            color = (255, 0, 255)
-            radius = 10
-        elif name in {"LEFTMOST", "RIGHTMOST", "TOPMOST", "BOTTOMMOST"}:
-            color = (0, 165, 255)
-            radius = 7
+    # Draw fold line
+    cv2.line(out, fold_line_a, fold_line_b, (255, 0, 255), 2)
+    draw_label(out, "FOLD_LINE", midpoint(fold_line_a, fold_line_b), (255, 0, 255), 0.5)
 
-        cv2.circle(out, pt, radius, color, -1)
-        label(out, name, (pt[0] + 8, pt[1] - 8), color)
+    # Draw pinch points
+    cv2.circle(out, pinch_a, 10, (255, 0, 255), -1)
+    cv2.circle(out, pinch_b, 10, (255, 0, 255), -1)
+    draw_label(out, "PINCH_1", (pinch_a[0] + 10, pinch_a[1] - 10), (255, 0, 255), 0.5)
+    draw_label(out, "PINCH_2", (pinch_b[0] + 10, pinch_b[1] - 10), (255, 0, 255), 0.5)
 
-    label(out, f"source: {source}", (20, 30), (255, 255, 255), 0.6)
-    label(out, f"confidence: {confidence:.2f}" if source == "YOLO" else "confidence: fallback", (20, 58), (255, 255, 255), 0.6)
-    label(out, "q quit | s save frame", (20, 86), (255, 255, 255), 0.6)
+    # Draw target points
+    cv2.circle(out, target_a, 8, (255, 255, 255), -1)
+    cv2.circle(out, target_b, 8, (255, 255, 255), -1)
+    draw_label(out, "TARGET_1", (target_a[0] + 10, target_a[1] - 10), (255, 255, 255), 0.5)
+    draw_label(out, "TARGET_2", (target_b[0] + 10, target_b[1] - 10), (255, 255, 255), 0.5)
+
+    # Draw arcs
+    draw_arc(out, pinch_a, target_a, height=70, color=(255, 0, 255), thickness=2)
+    draw_arc(out, pinch_b, target_b, height=70, color=(255, 0, 255), thickness=2)
+
+    # Draw ROI boundary softly, not a giant object rectangle
+    cv2.rectangle(out, (x, y), (x + w, y + h), (120, 120, 120), 1)
+    draw_label(out, f"fold_mode: {fold_mode}", (20, 30), (255, 255, 255), 0.6)
+    draw_label(out, "r = reselect ROI | q = quit | s = save", (20, 58), (255, 255, 255), 0.6)
 
     return out
 
 
-def midpoint(a, b):
-    return ((a[0] + b[0]) // 2, (a[1] + b[1]) // 2)
+def pick_roi(frame: np.ndarray):
+    roi = cv2.selectROI("Select Towel ROI", frame, fromCenter=False, showCrosshair=True)
+    cv2.destroyWindow("Select Towel ROI")
+    x, y, w, h = roi
+    if w <= 0 or h <= 0:
+        return None
+    return roi
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", default="0")
-    parser.add_argument("--model-path", default="yolo11n-seg.pt")
-    parser.add_argument("--min-conf", type=float, default=0.35)
-    parser.add_argument("--no-yolo", action="store_true")
+    parser.add_argument("--source", default="0", help="camera index or video path")
+    parser.add_argument(
+        "--fold-mode",
+        default="left_to_center",
+        choices=["left_to_center", "right_to_center", "top_to_center", "bottom_to_center"],
+    )
     parser.add_argument("--save-dir", default="debug_frames")
     args = parser.parse_args()
 
-    model = None
-    if not args.no_yolo and YOLO is not None:
-        print("Loading YOLO model. First run may download weights.")
-        model = YOLO(args.model_path)
-
     source = int(args.source) if args.source.isdigit() else args.source
-    cap = cv2.VideoCapture(source)
+    cap = cv2.VideoCapture(source, cv2.CAP_AVFOUNDATION)
 
     if not cap.isOpened():
         raise RuntimeError(f"Could not open source: {args.source}")
 
-    Path(args.save_dir).mkdir(exist_ok=True)
+    Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+
+    roi_rect = None
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        mask, conf = yolo_mask(frame, model, args.min_conf) if model is not None else (None, 0.0)
-        source_name = "YOLO"
+        if roi_rect is None:
+            draw_label(frame, "Press r to select towel ROI", (20, 30), (255, 255, 255), 0.7)
+            cv2.imshow("Laundry Corner POC", frame)
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord("q"):
+                break
+            if key == ord("r"):
+                roi_rect = pick_roi(frame)
+            continue
+
+        x, y, w, h = roi_rect
+        roi = frame[y:y + h, x:x + w]
+
+        mask = segment_towel(roi)
 
         if mask is None:
-            mask = fallback_mask(frame)
-            source_name = "threshold"
+            out = frame.copy()
+            cv2.rectangle(out, (x, y), (x + w, y + h), (120, 120, 120), 1)
+            draw_label(out, "No stable towel contour found in ROI", (20, 30), (0, 0, 255), 0.7)
+            draw_label(out, "Use a plain contrasting towel and keep background simple", (20, 58), (0, 0, 255), 0.55)
+        else:
+            corners = get_towel_corners(mask)
+            if corners is None:
+                out = frame.copy()
+                draw_label(out, "Could not estimate 4 corners", (20, 30), (0, 0, 255), 0.7)
+            else:
+                out = draw_result(frame, roi_rect, mask, corners, args.fold_mode)
 
-        out = draw(frame, mask, conf, source_name)
         cv2.imshow("Laundry Corner POC", out)
-
         key = cv2.waitKey(1) & 0xFF
 
         if key == ord("q"):
             break
-
+        if key == ord("r"):
+            roi_rect = pick_roi(frame)
         if key == ord("s"):
-            path = Path(args.save_dir) / f"laundry_poc_{int(time.time())}.jpg"
+            path = Path(args.save_dir) / f"laundry_clean_poc_{int(time.time())}.jpg"
             cv2.imwrite(str(path), out)
             print(f"Saved {path}")
 
